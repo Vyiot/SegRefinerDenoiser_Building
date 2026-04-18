@@ -55,6 +55,8 @@ class OEMBuildingDataset(Dataset):
                  test_mode=False,
                  use_x12=False,
                  use_t5_only=False,
+                 use_all_t=False,
+                 use_pseudo_direct=False,
                  file_client_args=dict(backend='disk')):
         self.data_root = data_root
         self.img_dir = img_dir
@@ -63,6 +65,8 @@ class OEMBuildingDataset(Dataset):
         self.test_mode = test_mode
         self.use_x12 = use_x12
         self.use_t5_only = use_t5_only
+        self.use_all_t = use_all_t
+        self.use_pseudo_direct = use_pseudo_direct
         self.file_client = mmcv.FileClient(**file_client_args)
 
         # Load split file
@@ -140,6 +144,30 @@ class OEMBuildingDataset(Dataset):
                         noise_mask_prev_path=label_path,
                         timestep=5
                     ))
+            elif not self.test_mode and self.use_all_t:
+                # All timesteps t∈{0..5} × 2 sources, always predict GT (x0)
+                for t in range(6):
+                    for source in ['noise_gen', 'mix']:
+                        data_infos.append(dict(
+                            filename=img_path,
+                            label_path=label_path,
+                            pseudo_path=pseudo_path,
+                            basename=fname,
+                            noise_mask_path=osp.join('noise_mask', source, str(t), fname),
+                            noise_mask_prev_path=label_path,
+                            timestep=t
+                        ))
+            elif not self.test_mode and self.use_pseudo_direct:
+                # Use pseudolabel directly as noisy input, fixed t=0 (no diffusion), target=GT
+                data_infos.append(dict(
+                    filename=img_path,
+                    label_path=label_path,
+                    pseudo_path=pseudo_path,
+                    basename=fname,
+                    noise_mask_path=pseudo_path,  # pseudolabel IS the noisy mask
+                    noise_mask_prev_path=label_path,
+                    timestep=0
+                ))
             else:
                 data_info = dict(
                     filename=img_path,
@@ -216,7 +244,7 @@ class OEMBuildingDataset(Dataset):
             ann_info = dict()
 
             results = dict(img_info=img_info, ann_info=ann_info)
-            if self.use_x12 or self.use_t5_only:
+            if self.use_x12 or self.use_t5_only or self.use_all_t or self.use_pseudo_direct:
                 results['noise_mask_path'] = osp.join(self.data_root, data_info['noise_mask_path'])
                 results['noise_mask_prev_path'] = osp.join(self.data_root, data_info['noise_mask_prev_path'])
                 results['timestep'] = np.array([data_info['timestep']], dtype=np.int64)

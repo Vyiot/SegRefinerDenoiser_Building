@@ -37,18 +37,19 @@ class SegRefinerSemantic(SegRefiner):
         output_file = self.get_output_filename(img_metas)
 
         if coarse_masks[0].masks.sum() <= 128:
-            return [(np.zeros_like(coarse_masks[0].masks[0]), output_file)]
+            empty = np.zeros_like(coarse_masks[0].masks[0])
+            # Check if baseline mode (val_t set) — only return single
+            if self.test_cfg.get('val_t', None) is not None:
+                return [(empty, output_file, 'single')]
+            return [(empty, output_file, 'single'), (empty, output_file, 'iterative')]
         
         current_device = img.device
         ori_shape = img_metas[0]['ori_shape'][:2]
 
-        # Direct 1-step xT → x0 (t=5 is the noise level)
-        indices = [5]
-
-        # global_step only (no local refinement)
+        # global input
         global_img, global_mask = self._get_global_input(img, coarse_masks, ori_shape, current_device)
 
-        # Backbone feature extraction (only when backbone exists)
+        # backbone features
         global_features = None
         if self.backbone is not None:
             if hasattr(self.backbone, 'in_channels') and self.backbone.in_channels == 4:
@@ -56,16 +57,42 @@ class SegRefinerSemantic(SegRefiner):
             else:
                 global_features = self.backbone(global_img)
 
-        model_size_mask, _ = self.p_sample_loop(
-            [(global_mask, global_img, None)],
-            indices, current_device, use_last_step=True,
-            features=global_features)
-        
-        ori_size_mask = F.interpolate(model_size_mask, size=ori_shape)
-        ori_size_mask = (ori_size_mask >= 0.5).float()
+        results = []
+        val_t = self.test_cfg.get('val_t', None)
 
-        mask = ori_size_mask.squeeze(0).squeeze(0)
-        return [(mask.cpu().numpy(), output_file)]
+        if val_t is not None:
+            # --- Baseline mode: single-step with fixed t (no diffusion) ---
+            indices_single = [val_t]
+            mask_single, _ = self.p_sample_loop(
+                [(global_mask, global_img, None)],
+                indices_single, current_device, use_last_step=True,
+                features=global_features)
+            mask_single = F.interpolate(mask_single, size=ori_shape)
+            mask_single = (mask_single >= 0.5).float().squeeze(0).squeeze(0)
+            results.append((mask_single.cpu().numpy(), output_file, 'single'))
+        else:
+            # --- Diffusion mode: run both single + iterative ---
+            # Single-step: xT → x0
+            indices_single = [self.num_timesteps - 1]  # [5]
+            mask_single, _ = self.p_sample_loop(
+                [(global_mask, global_img, None)],
+                indices_single, current_device, use_last_step=True,
+                features=global_features)
+            mask_single = F.interpolate(mask_single, size=ori_shape)
+            mask_single = (mask_single >= 0.5).float().squeeze(0).squeeze(0)
+            results.append((mask_single.cpu().numpy(), output_file, 'single'))
+
+            # Iterative: xT → x0 → xT-1 → x0 → ... → x0
+            indices_iter = list(range(self.num_timesteps - 1, -1, -1))  # [5,4,3,2,1,0]
+            mask_iter, _ = self.p_sample_loop(
+                [(global_mask, global_img, None)],
+                indices_iter, current_device, use_last_step=True,
+                features=global_features)
+            mask_iter = F.interpolate(mask_iter, size=ori_shape)
+            mask_iter = (mask_iter >= 0.5).float().squeeze(0).squeeze(0)
+            results.append((mask_iter.cpu().numpy(), output_file, 'iterative'))
+
+        return results
     
     def _get_global_input(self, img, coarse_masks, ori_shape, current_device):
         model_size = self.test_cfg.get('model_size', 256)

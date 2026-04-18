@@ -234,16 +234,19 @@ class ResBlock(TimestepBlock):
 
     def forward(self, x, emb):
         h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
-        if self.use_scale_shift_norm:
-            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-            scale, shift = th.chunk(emb_out, 2, dim=1)
-            h = out_norm(h) * (1 + scale) + shift
-            h = out_rest(h)
+        if emb is not None:
+            emb_out = self.emb_layers(emb).type(h.dtype)
+            while len(emb_out.shape) < len(h.shape):
+                emb_out = emb_out[..., None]
+            if self.use_scale_shift_norm:
+                out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+                scale, shift = th.chunk(emb_out, 2, dim=1)
+                h = out_norm(h) * (1 + scale) + shift
+                h = out_rest(h)
+            else:
+                h = h + emb_out
+                h = self.out_layers(h)
         else:
-            h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h
 
@@ -354,6 +357,7 @@ class DenoiseUNet(BaseModule):
         num_heads=1,
         num_heads_upsample=-1,
         learn_time_embd=False,
+        use_time_embd=True,
         return_logits=False,
         use_scale_shift_norm=False,
         backbone_channels=None # New: list of channels for multi-scale features [c1, c2, c3, c4]
@@ -378,13 +382,17 @@ class DenoiseUNet(BaseModule):
 
         time_embed_dim = model_channels * 4
         self.learn_time_embd = learn_time_embd
-        if learn_time_embd:
-            self.time_embed = nn.Embedding(6, time_embed_dim)
+        self.use_time_embd = use_time_embd
+        if use_time_embd:
+            if learn_time_embd:
+                self.time_embed = nn.Embedding(6, time_embed_dim)
+            else:
+                self.time_embed = nn.Sequential(
+                    linear(model_channels, time_embed_dim),
+                    nn.SiLU(),
+                    linear(time_embed_dim, time_embed_dim))
         else:
-            self.time_embed = nn.Sequential(
-                linear(model_channels, time_embed_dim),
-                nn.SiLU(),
-                linear(time_embed_dim, time_embed_dim))
+            self.time_embed = None
 
         # --- Backbone Projection (New) ---
         self.backbone_projs = nn.ModuleDict()
@@ -501,7 +509,9 @@ class DenoiseUNet(BaseModule):
         :return: an [N x C x ...] Tensor of outputs.
         """
         hs = []
-        if self.learn_time_embd:
+        if not self.use_time_embd:
+            emb = None
+        elif self.learn_time_embd:
             emb = self.time_embed(timesteps)
         else:
             emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))

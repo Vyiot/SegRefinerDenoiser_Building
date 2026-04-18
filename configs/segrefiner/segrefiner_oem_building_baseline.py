@@ -19,7 +19,8 @@ model = dict(
         num_heads=4,
         num_heads_upsample=-1,
         attention_strides=(16, 32),
-        learn_time_embd=True,
+        learn_time_embd=False,
+        use_time_embd=False,
         channel_mult=(1, 1, 2, 2, 4, 4),
         dropout=0.1,
         backbone_channels=None),
@@ -39,12 +40,12 @@ model = dict(
         fine_prob_thr=0.9,
         iou_thr=0.3,
         batch_max=32,
-        val_mode='single'))
+        val_t=0))
 
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 
-# Training pipeline: RGB + pre-computed noisy mask at t=5, predict GT directly
+# Training pipeline: pseudolabel directly as input, predict GT
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadPrecomputedNoisyMask'),
@@ -75,7 +76,7 @@ data = dict(
         pipeline=train_pipeline,
         type=dataset_type,
         data_root=data_root,
-        use_all_t=True,
+        use_pseudo_direct=True,
         split_file='train.txt'),
     train_dataloader=train_dataloader,
     val=dict(
@@ -89,7 +90,7 @@ data = dict(
         workers_per_gpu=1),
     test=dict())
 
-val_interval = 2200
+val_interval = 1000
 evaluation = dict(interval=val_interval, metric='mIoU', data_root=data_root)
 
 optimizer = dict(
@@ -101,18 +102,18 @@ optimizer = dict(
 optimizer_config = dict(
     grad_clip=dict(max_norm=0.5, norm_type=2))
 
-max_iters = 66000
+max_iters = 10000
 runner = dict(type='IterBasedRunner', max_iters=max_iters)
 
 lr_config = dict(
     policy='step',
     gamma=0.5,
     by_epoch=False,
-    step=[15000, 20000],
+    step=[6000, 8000],
     warmup='linear',
     warmup_by_epoch=False,
     warmup_ratio=0.001,
-    warmup_iters=1000)
+    warmup_iters=500)
 
 log_config = dict(
     interval=50,
@@ -122,4 +123,3 @@ log_config = dict(
 workflow = [('train', 1)]
 checkpoint_config = dict(
     by_epoch=False, interval=5000, save_last=False, max_keep_ckpts=1)
-

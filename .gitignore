@@ -26,8 +26,6 @@ wheels/
 MANIFEST
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -52,7 +50,6 @@ coverage.xml
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
 
@@ -112,11 +109,12 @@ checkpoints
 # custom
 *.pkl
 *.pkl.json
-*.log.json
 docs/modelzoo_statistics.md
 mmdet/.mim
 work_dirs/**
+!work_dirs/**/
 !work_dirs/**/*.log
+!work_dirs/**/*.log.json
 figures
 .DS_Store
 *.png
@@ -127,4 +125,3 @@ figures
 *.pth
 *.py~
 *.sh~
-*.pth

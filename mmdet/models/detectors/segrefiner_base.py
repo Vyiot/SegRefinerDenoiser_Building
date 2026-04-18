@@ -310,28 +310,32 @@ class SegRefiner(BaseModule):
         res, fine_probs = [], []
         for idx, data in enumerate(xs):
             x, img, _ = data  # x is the input mask (e.g. x5 pseudo-label)
-            
+            x_last = x.clone()  # keep original input for re-noising
+
             cur_features = features
-            
-            for i in indices:
+
+            for step_idx, i in enumerate(indices):
                 t = torch.tensor([i] * x.shape[0], device=current_device).long()
-                last_step_flag = (use_last_step and i==indices[-1])
+                last_step_flag = (use_last_step and i == indices[-1])
                 model_input = torch.cat((img, x), dim=1)
-                
-                # Predict x_{T-1} from x_T
+
+                # Predict x0 from x_t
                 x_pred_logits = self.p_sample(model_input, t, features=cur_features)
 
                 if last_step_flag:
                     # Final step: output sigmoid probabilities
                     x = x_pred_logits.sigmoid()
                 else:
-                    # Intermediate step: threshold to get 0/1 mask for next input
-                    x = (x_pred_logits >= 0).float()
-            
+                    # Intermediate step: predict x0, then re-noise to x_{t-1}
+                    x0_hat = (x_pred_logits >= 0).float()
+                    next_t = indices[step_idx + 1]
+                    t_next = torch.tensor([next_t] * x.shape[0], device=current_device).long()
+                    x = self.q_sample(x0_hat, x_last, t_next, current_device)
+
             res.append(x)
             # fine_probs is now just a dummy zeros tensor to keep API compatibility
             fine_probs.append(torch.zeros_like(x))
-            
+
         res = torch.cat(res, dim=0)
         fine_probs = torch.cat(fine_probs, dim=0)
         return res, fine_probs

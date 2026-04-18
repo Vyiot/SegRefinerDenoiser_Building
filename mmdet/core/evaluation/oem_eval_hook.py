@@ -51,10 +51,18 @@ class OEMBuildingEvalHook(Hook):
         model = runner.model
         model.eval()
 
-        # Accumulators
-        total_refined_i, total_refined_u = 0, 0
-        total_pseudo_i, total_pseudo_u = 0, 0
-        total_refined_mba, total_pseudo_mba = 0.0, 0.0
+        # Accumulators for single-step
+        s_ri, s_ru = 0, 0  # building
+        s_ri_bg, s_ru_bg = 0, 0  # background
+        s_mba_sum = 0.0
+        # Accumulators for iterative
+        it_ri, it_ru = 0, 0
+        it_ri_bg, it_ru_bg = 0, 0
+        it_mba_sum = 0.0
+        # Accumulators for pseudo
+        p_ri, p_ru = 0, 0
+        p_ri_bg, p_ru_bg = 0, 0
+        p_mba_sum = 0.0
         total_num = 0
 
         prog_bar = mmcv.ProgressBar(len(self.dataloader.dataset))
@@ -63,8 +71,13 @@ class OEMBuildingEvalHook(Hook):
             with torch.no_grad():
                 results = model(return_loss=False, rescale=True, **data)
 
-            for mask_arr, output_fname in results:
-                # basename is like 'aachen_1'
+            # results is a list of tuples: (mask_arr, output_fname, mode)
+            # Group by mode
+            single_results = [(m, f) for m, f, mode in results if mode == 'single']
+            iter_results = [(m, f) for m, f, mode in results if mode == 'iterative']
+            has_iter = len(iter_results) > 0
+
+            for idx, (s_mask, output_fname) in enumerate(single_results):
                 basename = osp.splitext(osp.basename(output_fname))[0]
                 gt_fname = basename + '.tif'
 
@@ -73,92 +86,114 @@ class OEMBuildingEvalHook(Hook):
 
                 gt = self._load_mask(gt_path)
                 pseudo = self._load_mask(pseudo_path)
-                refined = (mask_arr >= 0.5).astype(np.uint8)
+                refined_s = (s_mask >= 0.5).astype(np.uint8)
 
-                # Ensure all masks match GT shape for metrics
-                if refined.shape != gt.shape:
-                    refined = cv2.resize(refined, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
+                # Resize if needed
+                if refined_s.shape != gt.shape:
+                    refined_s = cv2.resize(refined_s, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
                 if pseudo.shape != gt.shape:
                     pseudo = cv2.resize(pseudo, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
 
                 # IoU building (class 1)
-                ri, ru = self._compute_iou(refined, gt)
-                pi, pu = self._compute_iou(pseudo, gt)
-                total_refined_i += ri
-                total_refined_u += ru
-                total_pseudo_i += pi
-                total_pseudo_u += pu
+                i, u = self._compute_iou(refined_s, gt)
+                s_ri += i; s_ru += u
+                i, u = self._compute_iou(pseudo, gt)
+                p_ri += i; p_ru += u
 
                 # IoU background (class 0)
-                ri_bg, ru_bg = self._compute_iou(1 - refined, 1 - gt)
-                pi_bg, pu_bg = self._compute_iou(1 - pseudo, 1 - gt)
-                
-                # Check for existence of bg_iou accumulators, init if needed
-                if not hasattr(self, '_accums_init'):
-                    self.total_refined_i_bg = 0
-                    self.total_refined_u_bg = 0
-                    self.total_pseudo_i_bg = 0
-                    self.total_pseudo_u_bg = 0
-                    self._accums_init = True
-                
-                self.total_refined_i_bg += ri_bg
-                self.total_refined_u_bg += ru_bg
-                self.total_pseudo_i_bg += pi_bg
-                self.total_pseudo_u_bg += pu_bg
+                i, u = self._compute_iou(1 - refined_s, 1 - gt)
+                s_ri_bg += i; s_ru_bg += u
+                i, u = self._compute_iou(1 - pseudo, 1 - gt)
+                p_ri_bg += i; p_ru_bg += u
+
+                # Iterative metrics (only if available)
+                if has_iter:
+                    it_mask, _ = iter_results[idx]
+                    refined_it = (it_mask >= 0.5).astype(np.uint8)
+                    if refined_it.shape != gt.shape:
+                        refined_it = cv2.resize(refined_it, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    i, u = self._compute_iou(refined_it, gt)
+                    it_ri += i; it_ru += u
+                    i, u = self._compute_iou(1 - refined_it, 1 - gt)
+                    it_ri_bg += i; it_ru_bg += u
+                    _, it_ba = self._compute_mba(gt, pseudo, refined_it)
+                    it_mba_sum += it_ba
 
                 # mBA
-                p_mba, r_mba = self._compute_mba(gt, pseudo, refined)
-                total_pseudo_mba += p_mba
-                total_refined_mba += r_mba
+                p_ba, s_ba = self._compute_mba(gt, pseudo, refined_s)
+                s_mba_sum += s_ba
+                p_mba_sum += p_ba
                 total_num += 1
 
                 prog_bar.update()
 
         # Compute aggregated metrics
-        refined_iou_building = total_refined_i / max(total_refined_u, 1)
-        refined_iou_bg = self.total_refined_i_bg / max(self.total_refined_u_bg, 1)
-        refined_miou = (refined_iou_building + refined_iou_bg) / 2
+        s_iou_b = s_ri / max(s_ru, 1)
+        s_iou_bg = s_ri_bg / max(s_ru_bg, 1)
+        s_miou = (s_iou_b + s_iou_bg) / 2
 
-        pseudo_iou_building = total_pseudo_i / max(total_pseudo_u, 1)
-        pseudo_iou_bg = self.total_pseudo_i_bg / max(self.total_pseudo_u_bg, 1)
-        pseudo_miou = (pseudo_iou_building + pseudo_iou_bg) / 2
+        p_iou_b = p_ri / max(p_ru, 1)
+        p_iou_bg = p_ri_bg / max(p_ru_bg, 1)
+        p_miou = (p_iou_b + p_iou_bg) / 2
 
-        refined_mba = total_refined_mba / max(total_num, 1)
-        pseudo_mba = total_pseudo_mba / max(total_num, 1)
-
-        # Cleanup accumulators for next run
-        del self._accums_init
+        s_mba = s_mba_sum / max(total_num, 1)
+        p_mba = p_mba_sum / max(total_num, 1)
 
         # Log to runner
-        runner.log_buffer.output['val/mIoU'] = refined_miou
-        runner.log_buffer.output['val/IoU.building'] = refined_iou_building
-        runner.log_buffer.output['val/IoU.background'] = refined_iou_bg
-        runner.log_buffer.output['val/mBA'] = refined_mba
-        runner.log_buffer.ready = True
+        runner.log_buffer.output['val/mIoU_single'] = s_miou
+        runner.log_buffer.output['val/IoU_single.building'] = s_iou_b
+        runner.log_buffer.output['val/IoU_single.background'] = s_iou_bg
+        runner.log_buffer.output['val/mBA_single'] = s_mba
 
         from terminaltables import AsciiTable
-        table_data = [
-            ['Class', 'Refined IoU', 'Pseudo IoU'],
-            ['background', f'{refined_iou_bg*100:.2f}', f'{pseudo_iou_bg*100:.2f}'],
-            ['building', f'{refined_iou_building*100:.2f}', f'{pseudo_iou_building*100:.2f}'],
-            ['Summary', f'mIoU: {refined_miou*100:.2f}', f'mIoU: {pseudo_miou*100:.2f}']
-        ]
+
+        if has_iter:
+            it_iou_b = it_ri / max(it_ru, 1)
+            it_iou_bg = it_ri_bg / max(it_ru_bg, 1)
+            it_miou = (it_iou_b + it_iou_bg) / 2
+            it_mba = it_mba_sum / max(total_num, 1)
+
+            runner.log_buffer.output['val/mIoU_iter'] = it_miou
+            runner.log_buffer.output['val/IoU_iter.building'] = it_iou_b
+            runner.log_buffer.output['val/IoU_iter.background'] = it_iou_bg
+            runner.log_buffer.output['val/mBA_iter'] = it_mba
+
+            table_data = [
+                ['Class', 'Single IoU', 'Iter IoU', 'Pseudo IoU'],
+                ['background', f'{s_iou_bg*100:.2f}', f'{it_iou_bg*100:.2f}', f'{p_iou_bg*100:.2f}'],
+                ['building', f'{s_iou_b*100:.2f}', f'{it_iou_b*100:.2f}', f'{p_iou_b*100:.2f}'],
+                ['Summary',
+                 f'mIoU: {s_miou*100:.2f}',
+                 f'mIoU: {it_miou*100:.2f}',
+                 f'mIoU: {p_miou*100:.2f}']
+            ]
+            mba_str = f'mBA: single={s_mba:.4f}, iter={it_mba:.4f}, pseudo={p_mba:.4f}'
+        else:
+            table_data = [
+                ['Class', 'Refined IoU', 'Pseudo IoU'],
+                ['background', f'{s_iou_bg*100:.2f}', f'{p_iou_bg*100:.2f}'],
+                ['building', f'{s_iou_b*100:.2f}', f'{p_iou_b*100:.2f}'],
+                ['Summary', f'mIoU: {s_miou*100:.2f}', f'mIoU: {p_miou*100:.2f}']
+            ]
+            mba_str = f'mBA: refined={s_mba:.4f}, pseudo={p_mba:.4f}'
+
+        runner.log_buffer.ready = True
         table = AsciiTable(table_data)
         
         runner.logger.info(
             f'\n{table.table}\n'
-            f'Val mBA: {refined_mba:.4f} (pseudo={pseudo_mba:.4f}, Δ={refined_mba - pseudo_mba:+.4f})\n'
+            f'{mba_str}\n'
             f'Images evaluated: {total_num}')
 
-        # Save best checkpoint
-        if self.save_best and refined_miou > self.best_miou:
+        # Save best checkpoint (based on single-step mIoU)
+        if self.save_best and s_miou > self.best_miou:
             prev_best = self.best_miou
-            self.best_miou = refined_miou
+            self.best_miou = s_miou
             save_path = osp.join(runner.work_dir, 'best_model.pth')
             runner.save_checkpoint(runner.work_dir, filename_tmpl='best_model.pth', save_optimizer=False)
             runner.logger.info(
-                f'★ New best mIoU: {refined_miou*100:.2f}% '
-                f'(prev: {prev_best*100:.2f}%, Δ=+{(refined_miou-prev_best)*100:.2f}%) '
+                f'★ New best mIoU: {s_miou*100:.2f}% '
+                f'(prev: {prev_best*100:.2f}%, Δ=+{(s_miou-prev_best)*100:.2f}%) '
                 f'→ saved to {save_path}')
 
         model.train()
